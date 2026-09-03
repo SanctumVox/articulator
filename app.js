@@ -35,7 +35,6 @@ const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(viewport.clientWidth, viewport.clientHeight);
 renderer.setClearColor(0x0B1221);
-renderer.localClippingEnabled = false; // starts in 3D mode; enabled when cross-section toggled
 // Filmic colour pipeline — realistic light response and highlight roll-off for wet tissue
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -73,9 +72,6 @@ function buildStudioEnvironment(rendererRef) {
 }
 scene.environment = buildStudioEnvironment(renderer);
 
-// Clipping plane at z=0 — slices internal structures to show mid-sagittal cross-section
-const clippingPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
-
 // Camera
 const camera = new THREE.PerspectiveCamera(45, viewport.clientWidth / viewport.clientHeight, 0.1, 100);
 camera.position.set(0.3, 0.1, 5.5);
@@ -99,12 +95,20 @@ dirLight.shadow.camera.right = 3;
 dirLight.shadow.camera.top = 3;
 dirLight.shadow.camera.bottom = -3;
 dirLight.shadow.bias = -0.0008;
-dirLight.shadow.radius = 4;
+// (No shadow.radius: it is ignored under PCFSoftShadowMap — softness there
+// comes from the map size, and 1024 reads well for a scene this size.)
 // Only recompute the shadow map while something is actually moving (see animate()).
 // Saves a full shadow pass every idle frame — meaningful on mobile/laptop GPUs.
 dirLight.shadow.autoUpdate = false;
 dirLight.shadow.needsUpdate = true;
 scene.add(dirLight);
+
+// Any geometry change made outside the tween loop (sliders, drag handles,
+// frame stepping, view/teeth toggles) must re-render the frozen shadow map,
+// otherwise the previous pose's shadow is drawn under the new one.
+function markShadowsDirty() {
+  dirLight.shadow.needsUpdate = true;
+}
 
 // Fill light — cool, opposite side, no shadow, softens the dark side
 const backLight = new THREE.DirectionalLight(0xc8d4e0, 0.55);
@@ -130,8 +134,8 @@ controls.dampingFactor = 0.08;
 controls.target.set(0.2, 0.1, 0);
 controls.update();
 
-// Vocal Tract — defaults to full 3D; clipping plane used for cross-section toggle
-const vocalTract = new VocalTract(scene, [clippingPlane]);
+// Vocal Tract — defaults to full 3D; the cross-section toggle swaps to a flat diagram
+const vocalTract = new VocalTract(scene);
 
 // Rim light — from front/camera side, grazes edges for separation and wet highlights
 const frontLight = new THREE.DirectionalLight(0xffffff, 0.7);
@@ -270,6 +274,17 @@ function selectSound(symbol) {
   playIPASound(sound.symbol);
 }
 
+// The complete lip pose for a sound. A sound with no lip data falls back to a
+// neutral parted mouth (otherwise the closed lips of a preceding bilabial would
+// stick on the next sound). Bilabials (openness:0) drive full closure;
+// labiodentals drive the lower-lip-to-teeth gesture. Shared by the animated
+// path and the step-forward button so both land on the same pose.
+function lipTargetFor(sound) {
+  const labiodental = sound.place === 'labiodental' ? 1 : 0;
+  const lipDefault = { rounding: 0, openness: 0.3, protrusion: 0, spread: 0 };
+  return { ...lipDefault, ...(sound.articulators.lips || {}), labiodental };
+}
+
 function animateToSound(sound) {
   tweenMgr.cancel();
   const art = sound.articulators;
@@ -316,15 +331,10 @@ function animateToSound(sound) {
     });
   }
 
-  // Animate lips — ALWAYS, so the lips reset between sounds. A sound with no lip
-  // data falls back to a neutral parted mouth (otherwise the closed lips of a
-  // preceding bilabial would stick on the next sound). Bilabials (openness:0)
-  // drive full closure; labiodentals drive the lower-lip-to-teeth gesture.
+  // Animate lips — ALWAYS, so the lips reset between sounds (see lipTargetFor).
   {
-    const labiodental = sound.place === 'labiodental' ? 1 : 0;
-    const lipDefault = { rounding: 0, openness: 0.3, protrusion: 0, spread: 0 };
     const lipTarget = { ...vocalTract.currentLips };
-    tweenMgr.tween(lipTarget, { ...lipDefault, ...(art.lips || {}), labiodental }, duration, (tgt) => {
+    tweenMgr.tween(lipTarget, lipTargetFor(sound), duration, (tgt) => {
       vocalTract.setLipShape(tgt);
     });
   }
@@ -551,6 +561,7 @@ function updateAirflow(sound) {
   const ingressive = af.type === 'click' || af.type === 'implosive';
 
   airflowFlow = {
+    symbol: sound.symbol,   // lets the toggle skip a re-seed for the same sound
     type: af.type,
     path: af.path,
     tC: AIRFLOW_CONSTRICT_T[af.constriction_point] ?? 1.0,
@@ -1118,6 +1129,7 @@ document.getElementById('btn-prev').addEventListener('click', () => {
   state.isPlaying = false;
   updatePlayButton();
   vocalTract.resetToNeutral();
+  markShadowsDirty();
 });
 
 document.getElementById('btn-next').addEventListener('click', () => {
@@ -1134,10 +1146,11 @@ document.getElementById('btn-next').addEventListener('click', () => {
         root: art.tongue_root,
       }, state.currentSound.place);
     }
-    if (art.lips) vocalTract.setLipShape(art.lips);
+    vocalTract.setLipShape(lipTargetFor(state.currentSound));
     if (art.velum) vocalTract.setVelumHeight(art.velum.height ?? (art.velum.raised ? 1 : 0));
     if (art.jaw) vocalTract.setJawOpenness(art.jaw.openness);
     vocalTract.setVoicing(art.vocal_folds?.vibrating ?? false);
+    markShadowsDirty();
   }
 });
 
@@ -1145,6 +1158,8 @@ document.getElementById('btn-next').addEventListener('click', () => {
 // ANATOMICAL LABELS
 // ============================================
 let labelElements = {};
+let labelsHiddenApplied = false;   // true once every label has been display:none'd
+const _labelScreen = new THREE.Vector3(); // scratch for projection — no per-label clone
 
 function createLabels() {
   const positions = vocalTract.getArticulatorPositions();
@@ -1159,9 +1174,14 @@ function createLabels() {
 
 function updateLabels() {
   if (!state.labelsVisible) {
-    for (const lab of Object.values(labelElements)) lab.el.style.display = 'none';
+    // Hide once, not every frame: repeated style writes are wasted work.
+    if (!labelsHiddenApplied) {
+      for (const lab of Object.values(labelElements)) lab.el.style.display = 'none';
+      labelsHiddenApplied = true;
+    }
     return;
   }
+  labelsHiddenApplied = false;
 
   const positions = vocalTract.getArticulatorPositions();
   const vw = viewport.clientWidth;
@@ -1171,7 +1191,7 @@ function updateLabels() {
   const placed = [];
   for (const [name, data] of Object.entries(labelElements)) {
     const pos3D = positions[name] || data.pos3D;
-    const screenPos = pos3D.clone().project(camera);
+    const screenPos = _labelScreen.copy(pos3D).project(camera);
     const x = (screenPos.x * 0.5 + 0.5) * vw;
     const y = (-screenPos.y * 0.5 + 0.5) * vh;
 
@@ -1234,7 +1254,11 @@ document.getElementById('btn-airflow').addEventListener('click', () => {
   state.airflowVisible = !state.airflowVisible;
   document.getElementById('btn-airflow').classList.toggle('active', state.airflowVisible);
   if (airflowParticles) airflowParticles.visible = state.airflowVisible;
-  if (state.airflowVisible && state.currentSound) {
+  // (Re)build the flow only if it is for a different sound than the one on
+  // screen — particles freeze while hidden, so re-seeding the same sound on
+  // every toggle would just stack a second stream on top of the first.
+  if (state.airflowVisible && state.currentSound
+      && (!airflowFlow || airflowFlow.symbol !== state.currentSound.symbol)) {
     updateAirflow(state.currentSound);
   }
 });
@@ -1248,6 +1272,7 @@ document.getElementById('btn-airflow').addEventListener('click', () => {
 document.getElementById('btn-teeth')?.addEventListener('click', () => {
   const on = vocalTract.toggleTeethXray();
   document.getElementById('btn-teeth')?.classList.toggle('active', on);
+  markShadowsDirty(); // translucent teeth stop writing depth → shadow changes
 });
 
 // ============================================
@@ -1257,8 +1282,8 @@ let crossSectionMode = false;
 document.getElementById('btn-cross-section')?.addEventListener('click', () => {
   crossSectionMode = !crossSectionMode;
   vocalTract.setViewMode(crossSectionMode ? 'crossSection' : '3d');
-  renderer.localClippingEnabled = crossSectionMode;
   document.getElementById('btn-cross-section')?.classList.toggle('active', crossSectionMode);
+  markShadowsDirty(); // whole scene was rebuilt
 });
 
 // ============================================
@@ -1299,7 +1324,6 @@ document.getElementById('adjust-reset').addEventListener('click', () => {
 
 // Read sliders and apply tongue position
 function applyTongueFromSliders() {
-  dirLight.shadow.needsUpdate = true; // geometry changes outside the tween loop
   const height = parseFloat(document.getElementById('sl-body-height').value);
   const frontness = parseFloat(document.getElementById('sl-body-front').value);
   const tipX = parseFloat(document.getElementById('sl-tip-x').value);
@@ -1351,6 +1375,7 @@ for (const [sliderId, handler] of Object.entries(sliderHandlers)) {
     const val = parseFloat(document.getElementById(sliderId).value);
     document.getElementById(handler.val).textContent = val.toFixed(2);
     handler.apply();
+    markShadowsDirty(); // every slider moves geometry outside the tween loop
   });
 }
 
@@ -1494,10 +1519,8 @@ function clamp01(v) { return Math.max(0, Math.min(1, v)); }
 
 function getPointerNDC(e) {
   const rect = canvas.getBoundingClientRect();
-  const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-  const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-  mouse.x = ((clientX - rect.left) / rect.width) * 2 - 1;
-  mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+  mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
 }
 
 function getDragPlane(handlePos) {
@@ -1522,6 +1545,9 @@ function onHandlePointerDown(e) {
     canvas.style.cursor = 'grabbing';
     controls.enabled = false;
     activeDragPlane = getDragPlane(dragHandle.position);
+    // Capture so the release reaches us even when the pointer leaves the
+    // canvas mid-drag (OrbitControls captures too, but only while enabled).
+    try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* not all inputs support capture */ }
     e.preventDefault();
   }
 }
@@ -1554,13 +1580,10 @@ function onHandlePointerMove(e) {
   }
 
   // Drag logic
-  const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-  const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-  const rect = canvas.getBoundingClientRect();
-  mouse.x = ((clientX - rect.left) / rect.width) * 2 - 1;
-  mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+  getPointerNDC(e);
   raycaster.setFromCamera(mouse, camera);
   if (!raycaster.ray.intersectPlane(activeDragPlane, dragIntersection)) return;
+  markShadowsDirty(); // the handle is about to move geometry
 
   const key = dragHandle.userData.handleKey;
 
@@ -1599,7 +1622,7 @@ function onHandlePointerMove(e) {
   e.preventDefault();
 }
 
-function onHandlePointerUp() {
+function onHandlePointerUp(e) {
   if (dragHandle) {
     dragHandle.scale.setScalar(1.0);
     dragHandle.visible = false;  // hide after releasing
@@ -1608,20 +1631,25 @@ function onHandlePointerUp() {
     dragHandle = null;
     activeDragPlane = null;
     controls.enabled = true;
+    if (e && canvas.hasPointerCapture?.(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
   }
 }
 
+// Pointer events cover mouse, pen and touch (OrbitControls sets touch-action:
+// none on the canvas), so no separate touch listeners — registering both used
+// to run every down/move handler twice on touch screens. pointercancel (the
+// browser taking over a gesture, a lost stylus) ends the drag like a release.
 canvas.addEventListener('pointerdown', onHandlePointerDown);
 canvas.addEventListener('pointermove', onHandlePointerMove);
 canvas.addEventListener('pointerup', onHandlePointerUp);
-canvas.addEventListener('touchstart', onHandlePointerDown, { passive: false });
-canvas.addEventListener('touchmove', onHandlePointerMove, { passive: false });
-canvas.addEventListener('touchend', onHandlePointerUp);
+canvas.addEventListener('pointercancel', onHandlePointerUp);
 
 // ============================================
 // RESIZE HANDLER
 // ============================================
-let lastAspect = 1;
+// Seeded from the real viewport so the initial onResize() call below does not
+// read as an orientation change and re-tween the camera.
+let lastAspect = viewport.clientWidth / viewport.clientHeight;
 function onResize() {
   const w = viewport.clientWidth;
   const h = viewport.clientHeight;
@@ -2423,6 +2451,10 @@ buildVowelChart();
 buildOtherChart();
 buildAccentGrid();
 createLabels();
+// Apply the viewport-dependent camera framing (portrait FOV widening, DPR)
+// once at startup — previously it only ran on a resize or orientation change,
+// so phones in portrait opened on the cropped desktop framing.
+onResize();
 animate();
 
 // Dismiss splash screen after 2.5 seconds, then show tutorial if first visit

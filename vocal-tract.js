@@ -13,6 +13,30 @@ import * as THREE from 'three';
 
 const DEPTH = 1.2;
 const HALF  = DEPTH / 2;
+
+// Jaw drop per unit of openness: jawGroup.position.y = -openness * JAW_DROP.
+//   openness=0.1 (/i/) → 0.028 (barely open) · 0.25 (/ə/) → 0.07 · 0.6 (/a/) → 0.168
+// Every tongue/lip compensation that has to "undo" the jaw drop reads this
+// same constant, so the pose stays consistent at every openness including 0.
+const JAW_DROP = 0.28;
+
+// Palate underside midline, root→tip, used to keep the tongue below the roof.
+// Piecewise linear; matched to the velum mesh underside
+// (velum 2D inner curve: -0.18→0.50, -0.32→0.47, -0.42→0.44, -0.48→0.36).
+const PALATE_PROFILE = [
+  { x:  1.10, y: 0.55 },
+  { x:  1.02, y: 0.62 },
+  { x:  0.95, y: 0.64 },
+  { x:  0.70, y: 0.70 },
+  { x:  0.40, y: 0.68 },
+  { x:  0.15, y: 0.65 },
+  { x: -0.08, y: 0.58 },   // palate-velum junction
+  { x: -0.18, y: 0.52 },   // matches velum underside
+  { x: -0.30, y: 0.47 },
+  { x: -0.42, y: 0.40 },
+  { x: -0.53, y: 0.32 },
+  { x: -0.70, y: 0.20 },   // pharynx region - no palate constraint
+];
 const SKIN_DEPTH = 1.4;
 const SKIN_HALF  = SKIN_DEPTH / 2;
 
@@ -261,13 +285,25 @@ function buildArchFromProfile(sagittalPoints, widthFn, options = {}) {
 // so the dorsum IS the contour and the tongue stays one solid,
 // connected "beanbag". The grid is closed and capped → watertight.
 // -------------------------------------------------------
-function buildTongue3DGeometry(upperContour, lowerContour) {
+// Tongue loft resolution. The vertex count is fixed by these two numbers, which
+// is what lets _rebuildTongueMesh update the geometry in place every frame
+// instead of allocating a new BufferGeometry (and GPU buffers) per tween step.
+const TONGUE_SEGS  = 60;   // stations root→tip
+const TONGUE_RAD   = 28;   // segments around each cross-section ring
+const TONGUE_VERTS = (TONGUE_SEGS + 1) * (TONGUE_RAD + 1) + 2; // rings + 2 cap centres
+
+function buildTongue3DGeometry(upperContour, lowerContour, existing = null) {
   // upperContour: [{x,y}, ...] root→tip (smooth upper surface)
   // lowerContour: [{x,y}, ...] root→tip (smooth under-surface)
   // Both are already smoothly interpolated via CatmullRom to the same count.
   // IMPORTANT: The contours must already be clamped to stay below the palate
   // with sufficient margin (archHeight + clearance). This function does NO
   // palate clamping — it only builds smooth geometry from the contours.
+  //
+  // existing: a geometry previously returned by this function. When given,
+  // positions are written straight into its position attribute (topology,
+  // uvs and index never change), normals and bounds are recomputed, and the
+  // same geometry is returned — zero geometry allocation on the hot path.
 
   // Two-rail loft: anchor each cross-section directly to the upper (dorsum) and
   // lower (underside) contours. The ring's TOP vertex sits exactly on the upper
@@ -277,8 +313,8 @@ function buildTongue3DGeometry(upperContour, lowerContour) {
   // and self-intersect the way the old swept tube did. The grid is closed and
   // capped at both ends, so the surface is watertight: no holes are possible.
 
-  const SEGS = 60;   // stations root→tip
-  const RAD  = 28;   // segments around each cross-section ring
+  const SEGS = TONGUE_SEGS;
+  const RAD  = TONGUE_RAD;
 
   // Resample both contours to SEGS+1 smooth, evenly-spaced stations.
   const upCurve = new THREE.CatmullRomCurve3(
@@ -296,9 +332,12 @@ function buildTongue3DGeometry(upperContour, lowerContour) {
     return 0.05 + 0.28 * bodyT * tipTaper * rootTaper;
   }
 
-  const verts   = [];
-  const uvs     = [];
-  const indices = [];
+  const reuse = !!(existing && existing.attributes.position
+    && existing.attributes.position.count === TONGUE_VERTS);
+  const verts   = reuse ? existing.attributes.position.array : new Float32Array(TONGUE_VERTS * 3);
+  const uvs     = reuse ? null : [];
+  const indices = reuse ? null : [];
+  let vi = 0;
 
   for (let i = 0; i <= SEGS; i++) {
     const t = i / SEGS;
@@ -315,38 +354,40 @@ function buildTongue3DGeometry(upperContour, lowerContour) {
       // contour (top); the sides bulge out to ±halfW at mid-height. The top
       // is pinned exactly to U and the bottom to L, so the dorsum IS the upper
       // contour — there is no separate flap to fold away.
-      const vx = L.x + (U.x - L.x) * vmix;
-      const vy = L.y + (U.y - L.y) * vmix;
-      const dz = c * hw;
-
-      verts.push(vx, vy, dz);
+      verts[vi++] = L.x + (U.x - L.x) * vmix;
+      verts[vi++] = L.y + (U.y - L.y) * vmix;
+      verts[vi++] = c * hw;
       // u runs root(0)→tip(1) along the length; v wraps around the cross-section.
-      uvs.push(t, j / RAD);
+      if (uvs) uvs.push(t, j / RAD);
     }
   }
 
   // Triangle strip indices connecting adjacent rings
-  for (let i = 0; i < SEGS; i++) {
-    for (let j = 0; j < RAD; j++) {
-      const a = i * (RAD + 1) + j;
-      const b = a + RAD + 1;
-      indices.push(a, b, a + 1);
-      indices.push(a + 1, b, b + 1);
+  if (indices) {
+    for (let i = 0; i < SEGS; i++) {
+      for (let j = 0; j < RAD; j++) {
+        const a = i * (RAD + 1) + j;
+        const b = a + RAD + 1;
+        indices.push(a, b, a + 1);
+        indices.push(a + 1, b, b + 1);
+      }
     }
   }
 
   // Cap at root end (i=0) — fan from the root midpoint.
-  const rootCenter = verts.length / 3;
-  verts.push((up[0].x + lo[0].x) / 2, (up[0].y + lo[0].y) / 2, 0);
-  uvs.push(0, 0.5);
-  for (let j = 0; j < RAD; j++) {
-    indices.push(rootCenter, j + 1, j);
+  const rootCenter = vi / 3;
+  verts[vi++] = (up[0].x + lo[0].x) / 2;
+  verts[vi++] = (up[0].y + lo[0].y) / 2;
+  verts[vi++] = 0;
+  if (uvs) uvs.push(0, 0.5);
+  if (indices) {
+    for (let j = 0; j < RAD; j++) indices.push(rootCenter, j + 1, j);
   }
 
   // Cap at tip end (i=SEGS) — fan from a center pushed slightly FORWARD along the
   // apex tangent so the end closes as a rounded DOME (a blunt pad), not a flat disc
   // or a sharp point. The push is small and scaled to the apex width.
-  const tipCenter = verts.length / 3;
+  const tipCenter = vi / 3;
   let atx = up[SEGS].x - up[SEGS - 1].x;
   let aty = up[SEGS].y - up[SEGS - 1].y;
   const aLen = Math.sqrt(atx * atx + aty * aty) || 1;
@@ -354,15 +395,24 @@ function buildTongue3DGeometry(upperContour, lowerContour) {
   const domeReach = 0.9 * getHalfW(1);        // how far the dome bulges past the last ring
   const tipMidX = (up[SEGS].x + lo[SEGS].x) / 2;
   const tipMidY = (up[SEGS].y + lo[SEGS].y) / 2;
-  verts.push(tipMidX + atx * domeReach, tipMidY + aty * domeReach, 0);
-  uvs.push(1, 0.5);
-  const tipBase = SEGS * (RAD + 1);
-  for (let j = 0; j < RAD; j++) {
-    indices.push(tipCenter, tipBase + j, tipBase + j + 1);
+  verts[vi++] = tipMidX + atx * domeReach;
+  verts[vi++] = tipMidY + aty * domeReach;
+  verts[vi++] = 0;
+  if (uvs) uvs.push(1, 0.5);
+  if (indices) {
+    const tipBase = SEGS * (RAD + 1);
+    for (let j = 0; j < RAD; j++) indices.push(tipCenter, tipBase + j, tipBase + j + 1);
+  }
+
+  if (reuse) {
+    existing.attributes.position.needsUpdate = true;
+    existing.computeVertexNormals();     // flags the normal attribute for upload
+    existing.computeBoundingSphere();    // frustum + shadow culling read this
+    return existing;
   }
 
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+  geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
   geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
   geo.setIndex(indices);
   geo.computeVertexNormals();
@@ -433,9 +483,8 @@ function buildLipTube(center, halfW, halfH, radius, upper, protrusion = 0) {
 // VocalTract class
 // =====================================================
 export default class VocalTract {
-  constructor(scene, clippingPlanes = []) {
+  constructor(scene) {
     this.scene = scene;
-    this.clippingPlanes = clippingPlanes;
     this.viewMode = '3d';  // '3d' | 'crossSection'
 
     this.group = new THREE.Group();
@@ -445,6 +494,12 @@ export default class VocalTract {
     this.skinVisible = false;
     this.teethXray = false;     // x-ray (translucent) teeth toggle; default solid
     this._teethMats = [];       // tooth materials, for the x-ray toggle
+    // 3D lip materials — created once, reused across every per-frame rebuild
+    // (a fresh MeshPhysicalMaterial per lip per tween frame used to leak).
+    this._lipMatUpper = null;
+    this._lipMatLower = null;
+    // Label anchor vectors, reused every frame by getArticulatorPositions().
+    this._artPos = null;
     this.voicingActive = false;
     this.voicingTime = 0;
 
@@ -502,10 +557,9 @@ export default class VocalTract {
     this._buildLowerLip();
     this._buildTrachea();
 
-    // NOTE: cross-section mode no longer clips. It is a genuinely flat,
+    // NOTE: cross-section mode does not clip. It is a genuinely flat,
     // painter-ordered diagram (see makeFlat / XS_ORDER), so no clipping
-    // planes are applied to any material here. _applyClipping is retained
-    // only for reference and is intentionally never called.
+    // planes are applied to any material.
 
     // Hide skin by default (no toggle button — articulators must be visible)
     this.skinGroup.visible = this.skinVisible;
@@ -521,55 +575,24 @@ export default class VocalTract {
   }
 
   // =====================
-  // CLIPPING (cross-section mode only)
-  // =====================
-  _applyClipping() {
-    this.group.traverse((child) => {
-      if (child.isMesh && child.material) {
-        let isSkin = false;
-        this.skinGroup.traverse((sc) => { if (sc === child) isSkin = true; });
-        if (!isSkin) {
-          const mats = Array.isArray(child.material) ? child.material : [child.material];
-          mats.forEach(m => {
-            m.clippingPlanes = this.clippingPlanes;
-            m.clipShadows = true;
-            m.needsUpdate = true;
-          });
-        }
-      }
-    });
-  }
-
-  _removeClipping() {
-    this.group.traverse((child) => {
-      if (child.isMesh && child.material) {
-        const mats = Array.isArray(child.material) ? child.material : [child.material];
-        mats.forEach(m => {
-          m.clippingPlanes = [];
-          m.clipShadows = false;
-          m.needsUpdate = true;
-        });
-      }
-    });
-  }
-
-  // =====================
   // VIEW MODE TOGGLE
   // =====================
   setViewMode(mode) {
     if (mode === this.viewMode) return;
     this.viewMode = mode;
 
-    // Clean up all meshes and rebuild
+    // Clean up all meshes and rebuild. _buildAll() already poses the tongue
+    // from currentTongue (both modes) and the 3D lips from currentLips.
     this._disposeAll();
     this._buildAll();
 
-    // Restore current articulator positions. Velum and jaw must be re-applied
-    // too — _buildAll() rebuilds their groups at identity (velum raised, jaw
-    // closed), but the rebuild-time tongue/lip compensations (jawDrop/jawComp)
-    // already assume currentJawOpen, so without this the pose is inconsistent.
-    this._rebuildTongueMesh();
-    this.setLipShape(this.currentLips);
+    // Restore the rest of the current pose. The flat 2D lip builders start
+    // from a neutral outline, so re-apply currentLips there. Velum and jaw
+    // must be re-applied in both modes — _buildAll() rebuilds their groups at
+    // identity (velum raised, jaw closed), but the rebuild-time tongue/lip
+    // compensations (jawDrop/jawComp) already assume currentJawOpen, so
+    // without this the pose is inconsistent.
+    if (!this.is3D) this.setLipShape(this.currentLips);
     this.setVelumHeight(this.currentVelumHeight);
     this.setJawOpenness(this.currentJawOpen);
   }
@@ -600,6 +623,12 @@ export default class VocalTract {
     this.lowerLipMesh = null;
     this.vocalFold1 = null;
     this.vocalFold2 = null;
+    // The reused 3D lip materials and the tooth materials were attached to
+    // meshes and have just been disposed above — drop the references so the
+    // next build recreates them instead of reviving disposed GPU state.
+    this._lipMatUpper = null;
+    this._lipMatLower = null;
+    this._teethMats = [];
 
     // Reset cross-section outline refs + lazily-shared flat materials. The
     // shared XS materials were just disposed above (they were attached to the
@@ -966,7 +995,9 @@ export default class VocalTract {
         sheen: 0.4, sheenColor: new THREE.Color(0xff9a8a),
         emissive: 0x000000, emissiveIntensity: 0
       });
-      this.vocalFold1 = new THREE.Mesh(foldGeo, this.vocalFoldMat.clone());
+      // Fold 1 takes the material itself, fold 2 a clone (each pulses its own
+      // emissive) — no orphaned template material left behind on rebuild.
+      this.vocalFold1 = new THREE.Mesh(foldGeo, this.vocalFoldMat);
       this.vocalFold1.position.set(-0.38, -0.73, 0);
       this.vocalFold1.rotation.z = 0.15;
 
@@ -1105,34 +1136,21 @@ export default class VocalTract {
   //   x ≈ -0.53 → uvula at y ≈ 0.35
   // ========================================
   _getPalateY(x) {
-    // Piecewise linear interpolation of the palate underside
-    // Profile matched to actual velum mesh underside positions
-    // (velum 2D inner curve: -0.18→0.50, -0.32→0.47, -0.42→0.44, -0.48→0.36)
-    const profile = [
-      { x:  1.10, y: 0.55 },
-      { x:  1.02, y: 0.62 },
-      { x:  0.95, y: 0.64 },
-      { x:  0.70, y: 0.70 },
-      { x:  0.40, y: 0.68 },
-      { x:  0.15, y: 0.65 },
-      { x: -0.08, y: 0.58 },   // palate-velum junction — lowered from 0.60
-      { x: -0.18, y: 0.52 },   // added: matches velum underside
-      { x: -0.30, y: 0.47 },   // lowered from 0.54 to match velum mesh
-      { x: -0.42, y: 0.40 },   // added: matches velum underside
-      { x: -0.53, y: 0.32 },   // lowered from 0.35
-      { x: -0.70, y: 0.20 },   // pharynx region - no palate constraint
-    ];
+    // Piecewise linear interpolation of PALATE_PROFILE (module constant — this
+    // runs many times per tongue rebuild, so no per-call table allocation).
+    const profile = PALATE_PROFILE;
+    const last = profile.length - 1;
     // Clamp x to profile range
     if (x >= profile[0].x) return profile[0].y;
-    if (x <= profile[profile.length - 1].x) return profile[profile.length - 1].y;
+    if (x <= profile[last].x) return profile[last].y;
     // Find surrounding points and interpolate
-    for (let i = 0; i < profile.length - 1; i++) {
+    for (let i = 0; i < last; i++) {
       if (x <= profile[i].x && x >= profile[i + 1].x) {
         const t = (x - profile[i + 1].x) / (profile[i].x - profile[i + 1].x);
         return profile[i + 1].y + t * (profile[i].y - profile[i + 1].y);
       }
     }
-    return 0.65; // fallback
+    return profile[last].y; // unreachable: x is clamped above
   }
 
   // Offset from _getPalateY (palate midline) to actual 3D palate mesh bottom surface.
@@ -1356,7 +1374,7 @@ export default class VocalTract {
     // (mylohyoid muscle, sublingual space) raises the effective floor.
     // Original jaw outer shell: (-0.48,-0.24), (-0.25,-0.12), (0.15,-0.04), (0.75,0.04), (1.15,0.10)
     // Inner surface sits ~0.10-0.15 above the outer shell at mid-mouth.
-    const jawDrop = (this.currentJawOpen || 0.2) * 0.28;
+    const jawDrop = (this.currentJawOpen ?? 0.2) * JAW_DROP;
 
     // Jaw inner top Y at a given x (piecewise linear — raised from outer shell)
     const jawInnerProfile = [
@@ -1499,7 +1517,7 @@ export default class VocalTract {
   // Flat point list for cross-section mode (closed shape)
   _getTonguePoints() {
     const t = this.currentTongue;
-    const jawDrop = (this.currentJawOpen || 0.2) * 0.28;
+    const jawDrop = (this.currentJawOpen ?? 0.2) * JAW_DROP;
 
     // Jaw inner top Y at a given x (same raised values as _getTongueContours)
     const jawInnerProfile = [
@@ -1613,38 +1631,50 @@ export default class VocalTract {
     return pts;
   }
 
-  _rebuildTongueMesh() {
-    // Dispose the previous tongue geometry (3D mesh OR 2D flat fill) + its
-    // outline. Materials are reused (this.tongueMat in 3D, the lazily-created
-    // XS materials in 2D), so only geometries are disposed here.
-    if (this.tongueMesh) {
-      this.group.remove(this.tongueMesh);
-      this.tongueMesh.geometry?.dispose();
-    }
+  _disposeXsTongueOutline() {
     if (this._xsTongueOutline) {
       this.group.remove(this._xsTongueOutline);
       this._xsTongueOutline.geometry.dispose();
       this._xsTongueOutline = null;
     }
+  }
 
+  _rebuildTongueMesh() {
     if (this.is3D) {
       // Full 3D tongue as a two-rail loft between the upper/lower contours.
       // The upper contour is already clamped by _clampContourToPalate with
       // an arch-depth-aware gap, so the 3D mesh naturally stays below the
       // palate at all z positions without any per-vertex clamping.
       const { upper, lower } = this._getTongueContours();
+      // Hot path: the loft topology is fixed, so once the 3D mesh exists its
+      // positions are rewritten in place (no geometry/GPU buffer churn per
+      // tween frame). A fresh mesh is only built on the first call after a
+      // mode switch.
+      if (this.tongueMesh && this.tongueMesh.userData.tongue3D) {
+        buildTongue3DGeometry(upper, lower, this.tongueMesh.geometry);
+        return;
+      }
+      if (this.tongueMesh) {
+        this.group.remove(this.tongueMesh);
+        this.tongueMesh.geometry?.dispose();
+      }
+      this._disposeXsTongueOutline();
       const geo = buildTongue3DGeometry(upper, lower);
-      // DoubleSide: the tongue is a closed solid, so interior faces are
-      // occluded — but rendering both sides guarantees an inward-wound end cap
-      // can never read as a hollow dark "hole" when viewed end-on.
-      this.tongueMat.side = THREE.DoubleSide;
-      this.tongueMat.clippingPlanes = [];
       this.tongueMesh = new THREE.Mesh(geo, this.tongueMat);
+      this.tongueMesh.userData.tongue3D = true;
       this.tongueMesh.castShadow = true;
       this.tongueMesh.receiveShadow = true;
       this.group.add(this.tongueMesh);
       this.meshes.tongue = this.tongueMesh;
     } else {
+      // Flat fill: the outline point count varies with the shape, so dispose
+      // the previous fill + outline geometries and rebuild. Materials are
+      // reused (the lazily-created XS materials), so only geometries go.
+      if (this.tongueMesh) {
+        this.group.remove(this.tongueMesh);
+        this.tongueMesh.geometry?.dispose();
+      }
+      this._disposeXsTongueOutline();
       // Flat painter-ordered cross-section tongue: a clean pink fill + crisp
       // outline (NO speckled texture, NO clipping). Materials are lazily
       // created once and reused across the constant rebuilds.
@@ -1732,12 +1762,28 @@ export default class VocalTract {
 
   // A dental arch of rounded crowns. Half-arch defined for z>0 and mirrored.
   // archCx is the lingual centre the crowns face outward from.
+  // Register a tooth material for the x-ray toggle. Remembers the material's
+  // solid-state flags so switching x-ray off restores exactly what the builder
+  // set (flat cross-section fills are painter-ordered and must keep
+  // depthWrite off; 3D enamel must get it back), and honours the current
+  // x-ray state on (re)build.
+  _registerToothMat(mat) {
+    mat.userData.solid = { transparent: mat.transparent, opacity: mat.opacity, depthWrite: mat.depthWrite };
+    this._teethMats.push(mat);
+    if (this.teethXray) this._applyToothXray(mat, true);
+  }
+
+  _applyToothXray(mat, on) {
+    const solid = mat.userData.solid;
+    mat.transparent = on ? true : solid.transparent;
+    mat.opacity     = on ? 0.13 : solid.opacity;   // a faint ghost of teeth, not a solid wall
+    mat.depthWrite  = on ? false : solid.depthWrite;
+    mat.needsUpdate = true;
+  }
+
   _buildToothArch(parent, baseY, scale = 1) {
     const mat = this._enamelMaterial(0xf0e8e0);
-    // Honour the current x-ray state on (re)build, and register the material so
-    // the toggle can find it later.
-    if (this.teethXray) { mat.transparent = true; mat.opacity = 0.13; mat.depthWrite = false; }
-    this._teethMats.push(mat);
+    this._registerToothMat(mat);
     const archCx = 0.45;
     // [x, z, width, height, depth] — incisor → lateral → canine → premolars → molar
     const half = [
@@ -1766,7 +1812,6 @@ export default class VocalTract {
 
   _buildUpperTeeth() {
     if (this.is3D) {
-      this._teethMats = [];   // fresh list each full build (upper runs before lower)
       this.meshes.upperTeeth = this._buildToothArch(this.group, 0.42, 1.0);
     } else {
       const shape = new THREE.Shape();
@@ -1775,6 +1820,7 @@ export default class VocalTract {
       shape.lineTo(1.05, 0.50); shape.closePath();
       this.meshes.upperTeeth = this._xsFlat(
         this.group, shape, XS.teeth, XS_ORDER.front);
+      this._registerToothMat(this.meshes.upperTeeth.material);
     }
   }
 
@@ -1796,6 +1842,7 @@ export default class VocalTract {
       shape.lineTo(1.02, 0.16); shape.closePath();
       this.meshes.lowerTeeth = this._xsFlat(
         this.jawGroup, shape, XS.teeth, XS_ORDER.front);
+      this._registerToothMat(this.meshes.lowerTeeth.material);
     }
   }
 
@@ -1875,7 +1922,8 @@ export default class VocalTract {
     const { rounding, openness, protrusion, spread } = this.currentLips;
     const labiodental = this.currentLips.labiodental || 0;
 
-    // Remove old lip meshes
+    // Remove old lip meshes. Only the geometries are disposed — the two lip
+    // materials are created once below and shared by every rebuild.
     if (this.upperLipMesh) {
       this.upperLipMesh.parent?.remove(this.upperLipMesh);
       this.upperLipMesh.geometry.dispose();
@@ -1885,7 +1933,10 @@ export default class VocalTract {
       this.lowerLipMesh.geometry.dispose();
     }
 
-    const lipMat = this._mucosaMaterial(0xc25f5f, { roughness: 0.45, clearcoat: 0.5, sheenColor: 0xd86060 });
+    if (!this._lipMatUpper) {
+      this._lipMatUpper = this._mucosaMaterial(0xc25f5f, { roughness: 0.45, clearcoat: 0.5, sheenColor: 0xd86060 });
+      this._lipMatLower = this._lipMatUpper.clone();
+    }
 
     // Mouth center and size — now positioned right in front of teeth
     const cx = 1.30 + protrusion * 0.12;
@@ -1900,7 +1951,7 @@ export default class VocalTract {
     // drop. `closed` ramps 0→1 as openness falls below ~0.08. Open sounds
     // (closed≈0) keep the previous behaviour exactly.
     const closed = Math.max(0, Math.min(1, 1 - openness / 0.08));
-    const jawComp = (this.currentJawOpen || 0.2) * 0.28; // how far jawGroup is dropped
+    const jawComp = (this.currentJawOpen ?? 0.2) * JAW_DROP; // how far jawGroup is dropped
     const halfHopen = 0.09 + openness * 0.08;
     const halfH = halfHopen * (1 - closed) + 0.015 * closed;
     const upperCy = cy + 0.02 * closed;                  // upper lip settles onto the seam
@@ -1911,8 +1962,12 @@ export default class VocalTract {
     const upperGeo = buildLipTube(
       { x: cx, y: upperCy }, halfW, halfH, radius, true, protrusion * 0.1
     );
-    this.upperLipMesh = new THREE.Mesh(upperGeo, lipMat);
+    this.upperLipMesh = new THREE.Mesh(upperGeo, this._lipMatUpper);
     this.upperLipMesh.renderOrder = 2;
+    // Opaque tissue: shadow flags are set here (not only by the one-time
+    // traverse in _buildAll) because these meshes are recreated per update.
+    this.upperLipMesh.castShadow = true;
+    this.upperLipMesh.receiveShadow = true;
     this.group.add(this.upperLipMesh);
     this.meshes.upperLip = this.upperLipMesh;
 
@@ -1922,8 +1977,10 @@ export default class VocalTract {
       { x: cx - labiodental * 0.05, y: lowerCyLocal + labiodental * 0.12 },
       halfW, halfH * (1 - labiodental * 0.25), radius * 1.1, false, protrusion * 0.1
     );
-    this.lowerLipMesh = new THREE.Mesh(lowerGeo, lipMat.clone());
+    this.lowerLipMesh = new THREE.Mesh(lowerGeo, this._lipMatLower);
     this.lowerLipMesh.renderOrder = 2;
+    this.lowerLipMesh.castShadow = true;
+    this.lowerLipMesh.receiveShadow = true;
     this.jawGroup.add(this.lowerLipMesh);
     this.meshes.lowerLip = this.lowerLipMesh;
   }
@@ -1946,12 +2003,7 @@ export default class VocalTract {
   // and articulation behind it; off = full solid teeth.
   setTeethXray(on) {
     this.teethXray = on;
-    for (const m of this._teethMats) {
-      m.transparent = on;
-      m.opacity = on ? 0.13 : 1.0;   // a faint ghost of teeth, not a solid wall
-      m.depthWrite = !on;
-      m.needsUpdate = true;
-    }
+    for (const m of this._teethMats) this._applyToothXray(m, on);
   }
 
   toggleTeethXray() {
@@ -2383,11 +2435,7 @@ export default class VocalTract {
 
   setJawOpenness(openness) {
     this.currentJawOpen = openness;
-    // Jaw drop multiplier 0.28 gives realistic range:
-    //   openness=0.1 (/i/) → drop=0.028 (barely open)
-    //   openness=0.25 (/ə/) → drop=0.07 (moderate)
-    //   openness=0.6 (/a/) → drop=0.168 (clearly open)
-    const drop = openness * 0.28;
+    const drop = openness * JAW_DROP; // see JAW_DROP for the realistic range
     this.jawGroup.position.y = -drop;
     this.jawGroup.rotation.z = -openness * 0.04;
   }
@@ -2447,23 +2495,34 @@ export default class VocalTract {
     }
   }
 
+  // Label anchors in tract space. Called every frame by the label overlay, so
+  // the Vector3s are allocated once and updated in place; callers must treat
+  // the returned vectors as read-only and copy before mutating.
   getArticulatorPositions() {
-    return {
-      'Lips': new THREE.Vector3(1.35, 0.42, 0),
-      'Upper Teeth': new THREE.Vector3(1.12, 0.42, 0),
-      'Lower Teeth': new THREE.Vector3(1.10, 0.08, 0),
-      'Alveolar Ridge': new THREE.Vector3(1.00, 0.70, 0),
-      'Hard Palate': new THREE.Vector3(0.50, 0.72, 0),
-      'Soft Palate (Velum)': new THREE.Vector3(-0.28, 0.58, 0),
-      'Uvula': new THREE.Vector3(-0.52, 0.30, 0),
-      'Tongue Tip': new THREE.Vector3(this.currentTongue.tip.x, this.currentTongue.tip.y + 0.10, 0),
-      'Tongue Blade': new THREE.Vector3(this.currentTongue.blade.x, this.currentTongue.blade.y + 0.14, 0),
-      'Tongue Body': new THREE.Vector3(this.currentTongue.body.x, this.currentTongue.body.y + 0.20, 0),
-      'Tongue Root': new THREE.Vector3(this.currentTongue.root.x, this.currentTongue.root.y, 0),
-      'Pharyngeal Wall': new THREE.Vector3(-0.72, 0.1, 0),
-      'Epiglottis': new THREE.Vector3(-0.18, -0.38, 0),
-      'Larynx': new THREE.Vector3(-0.38, -0.90, 0),
-      'Nasal Cavity': new THREE.Vector3(0.50, 1.02, 0),
-    };
+    if (!this._artPos) {
+      this._artPos = {
+        'Lips': new THREE.Vector3(1.35, 0.42, 0),
+        'Upper Teeth': new THREE.Vector3(1.12, 0.42, 0),
+        'Lower Teeth': new THREE.Vector3(1.10, 0.08, 0),
+        'Alveolar Ridge': new THREE.Vector3(1.00, 0.70, 0),
+        'Hard Palate': new THREE.Vector3(0.50, 0.72, 0),
+        'Soft Palate (Velum)': new THREE.Vector3(-0.28, 0.58, 0),
+        'Uvula': new THREE.Vector3(-0.52, 0.30, 0),
+        'Tongue Tip': new THREE.Vector3(),
+        'Tongue Blade': new THREE.Vector3(),
+        'Tongue Body': new THREE.Vector3(),
+        'Tongue Root': new THREE.Vector3(),
+        'Pharyngeal Wall': new THREE.Vector3(-0.72, 0.1, 0),
+        'Epiglottis': new THREE.Vector3(-0.18, -0.38, 0),
+        'Larynx': new THREE.Vector3(-0.38, -0.90, 0),
+        'Nasal Cavity': new THREE.Vector3(0.50, 1.02, 0),
+      };
+    }
+    const t = this.currentTongue, p = this._artPos;
+    p['Tongue Tip'].set(t.tip.x, t.tip.y + 0.10, 0);
+    p['Tongue Blade'].set(t.blade.x, t.blade.y + 0.14, 0);
+    p['Tongue Body'].set(t.body.x, t.body.y + 0.20, 0);
+    p['Tongue Root'].set(t.root.x, t.root.y, 0);
+    return p;
   }
 }
