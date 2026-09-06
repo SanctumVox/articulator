@@ -1,0 +1,11 @@
+{
+  "name": "Articulator",
+  "install": "bash build-web.sh",
+  "terminals": [
+    {
+      "name": "web",
+      "command": "bash build-web.sh && python3 -m http.server 8000 --directory web-dist"
+    }
+  ],
+  "ports": [{ "name": "web server", "port": 8000 }]
+}
